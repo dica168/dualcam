@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Rear camera ring -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M40,54a16,16 0 1,1 32,0a16,16 0 1,1 -32,0"
+        android:strokeWidth="5"
+        android:strokeColor="#8AB4F8" />
+    <path
+        android:fillColor="#8AB4F8"
+        android:pathData="M54,54m-6.5,0a6.5,6.5 0 1,1 13,0a6.5,6.5 0 1,1 -13,0" />
+    <!-- Front camera ring, overlapping -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M56,62a11,11 0 1,1 22,0a11,11 0 1,1 -22,0"
+        android:strokeWidth="4"
+        android:strokeColor="#81C995" />
+    <path
+        android:fillColor="#81C995"
+        android:pathData="M67,62m-4,0a4,4 0 1,1 8,0a4,4 0 1,1 -8,0" />
+</vector>
