@@ -104,6 +104,7 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
                                 lastMediaUri = composed ?: event.back ?: event.front,
                                 lastMediaIsVideo = true,
                                 message = when {
+                                    composed != null && event.audioDropped -> "已保存合拍视频（麦克风不可用，本段无声）"
                                     composed != null -> "已保存合拍视频"
                                     separate.size == 2 -> "已分别保存前后两段视频"
                                     separate.size == 1 -> "已保存 1 段视频"
@@ -121,13 +122,20 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
                             )
                         }
                     }
+                    is CaptureEvent.Notice -> {
+                        _uiState.update {
+                            it.copy(message = event.message, rearZoomRange = session.rearZoomRange())
+                        }
+                    }
                 }
             }
         }
         viewModelScope.launch {
             session.isRecording.collect { recording ->
                 _uiState.update { state ->
-                    state.copy(recording = recording, composing = false)
+                    // `composing` covers the gap between stop and the saved/failed event; it is
+                    // only cleared here when a new recording starts.
+                    state.copy(recording = recording, composing = if (recording) false else state.composing)
                 }
                 timerJob?.cancel()
                 if (recording) {
@@ -183,6 +191,13 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Re-runs camera discovery after a failed start (the failure may have been transient). */
+    fun retry() {
+        val owner = lifecycleOwner ?: return
+        _uiState.update { it.copy(ready = false, supported = true, supportMessage = null) }
+        attach(owner)
+    }
+
     fun setLayout(layout: DualLayout) {
         _uiState.update { it.copy(layout = layout) }
         session.updateLiveLayout(layout, _uiState.value.backPrimary)
@@ -203,6 +218,7 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun toggleSaveSeparate() {
+        if (_uiState.value.recording || _uiState.value.composing) return
         val next = !_uiState.value.saveSeparate
         prefs.edit().putBoolean(KEY_SAVE_SEPARATE, next).apply()
         _uiState.update { it.copy(saveSeparate = next) }
@@ -210,24 +226,30 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun setPhotoQuality(quality: PhotoQuality) {
+        if (quality == _uiState.value.photoQuality || _uiState.value.recording || _uiState.value.composing) return
         prefs.edit().putInt(KEY_PHOTO_QUALITY, quality.ordinal).apply()
         _uiState.update { it.copy(photoQuality = quality) }
         session.applyCaptureQuality(quality, _uiState.value.videoQuality)
+        // The ImageCapture resolution is part of the binding.
+        rebind()
     }
 
     fun setVideoQuality(quality: VideoQuality) {
+        if (_uiState.value.recording || _uiState.value.composing) return
         prefs.edit().putInt(KEY_VIDEO_QUALITY, quality.ordinal).apply()
         _uiState.update { it.copy(videoQuality = quality) }
         session.applyCaptureQuality(_uiState.value.photoQuality, quality)
+        if (_uiState.value.saveSeparate) rebind()
     }
 
     fun setFlashMode(mode: FlashMode) {
-        if (_uiState.value.recording) return
+        if (_uiState.value.recording || _uiState.value.composing) return
         _uiState.update { it.copy(flashMode = mode) }
         session.applyFlash(mode)
     }
 
     fun setRearZoom(equivalent: Float) {
+        if (_uiState.value.composing) return
         val state = _uiState.value
         val clamped = equivalent.coerceIn(state.pinchZoomMin, state.pinchZoomMax)
         val lens = lensForEquivalent(clamped, state.rearLens, state.availableLenses)
@@ -235,14 +257,19 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun selectRearStop(equivalent: Float) {
-        val stop = nearestRearZoomStop(equivalent)
-        val (lens, _) = rearStopTarget(stop.equivalent, _uiState.value.availableLenses)
+        if (_uiState.value.composing) return
+        val state = _uiState.value
+        val stop = nearestRearZoomStop(equivalent.coerceIn(state.pinchZoomMin, state.pinchZoomMax))
+        val (lens, _) = rearStopTarget(stop.equivalent, state.availableLenses)
         applyRearZoom(stop.equivalent, lens)
     }
 
-    private fun applyRearZoom(equivalent: Float, lens: RearLens) {
+    private fun applyRearZoom(equivalent: Float, requestedLens: RearLens) {
         val state = _uiState.value
         val owner = lifecycleOwner ?: return
+        // Separate-file recording cannot rebind cameras without ending the recording,
+        // so the physical lens is locked and only digital zoom is applied.
+        val lens = if (state.recording && state.saveSeparate) state.rearLens else requestedLens
         val lensChanged = lens != state.rearLens
         _uiState.update { it.copy(rearZoom = equivalent, rearLens = lens) }
         if (lensChanged) {
@@ -260,17 +287,6 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun cycleFlash() {
-        if (_uiState.value.recording) return
-        val next = when (_uiState.value.flashMode) {
-            FlashMode.Off -> FlashMode.Auto
-            FlashMode.Auto -> FlashMode.On
-            FlashMode.On -> FlashMode.Off
-        }
-        _uiState.update { it.copy(flashMode = next) }
-        session.applyFlash(next)
-    }
-
     fun toggleTorch() {
         val enable = !_uiState.value.torchOn
         if (session.setTorch(enable)) {
@@ -280,29 +296,38 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
 
     fun takePhoto() {
         val state = _uiState.value
-        if (!state.supported || state.capturing || state.recording) return
+        if (!state.supported || state.capturing || state.recording || state.composing) return
         _uiState.update { it.copy(capturing = true, message = null) }
         viewModelScope.launch {
-            session.takePhotos(state.layout, state.backPrimary, state.saveSeparate)
+            // An uncaught exception in viewModelScope crashes the process; surface it instead.
+            runCatching { session.takePhotos(state.layout, state.backPrimary, state.saveSeparate) }
+                .onFailure { error ->
+                    _uiState.update { it.copy(capturing = false, message = error.message ?: "拍照失败") }
+                }
         }
     }
 
     fun toggleRecording(audioEnabled: Boolean) {
         val state = _uiState.value
         val owner = lifecycleOwner ?: return
-        if (!state.supported || state.capturing) return
+        if (!state.supported || state.capturing || state.composing) return
         if (state.recording) {
+            _uiState.update { it.copy(composing = true) }
             session.stopRecording()
         } else {
             viewModelScope.launch {
-                session.startRecording(
-                    owner = owner,
-                    audioEnabled = audioEnabled,
-                    layout = state.layout,
-                    backPrimary = state.backPrimary,
-                    saveSeparate = state.saveSeparate,
-                    zoom = state.rearZoom,
-                )
+                runCatching {
+                    session.startRecording(
+                        owner = owner,
+                        audioEnabled = audioEnabled,
+                        layout = state.layout,
+                        backPrimary = state.backPrimary,
+                        saveSeparate = state.saveSeparate,
+                        zoom = state.rearZoom,
+                    )
+                }.onFailure { error ->
+                    _uiState.update { it.copy(message = error.message ?: "无法启动录像") }
+                }
             }
         }
     }
@@ -323,6 +348,7 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
             rearLens = state.rearLens,
             flashMode = state.flashMode,
             saveSeparate = state.saveSeparate,
+            photoQuality = state.photoQuality,
         )
     }
 

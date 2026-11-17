@@ -108,9 +108,20 @@ data class ZoomRange(
 
 enum class FlashMode { Off, Auto, On }
 
-enum class PhotoQuality(val label: String, val width: Int, val height: Int, val jpeg: Int) {
-    Standard("标准", 1080, 2400, 88),
-    High("高清", 1440, 3200, 95),
+/**
+ * [captureWidth]/[captureHeight] is the ImageCapture request (sensor orientation, 4:3); the
+ * concurrent-camera HAL may cap it lower. [width]/[height] is the composed output.
+ */
+enum class PhotoQuality(
+    val label: String,
+    val width: Int,
+    val height: Int,
+    val jpeg: Int,
+    val captureWidth: Int,
+    val captureHeight: Int,
+) {
+    Standard("标准", 1080, 2400, 88, 1920, 1440),
+    High("高清", 1440, 3200, 95, 4000, 3000),
 }
 
 enum class VideoQuality(val label: String, val width: Int, val height: Int, val bitrate: Int) {
@@ -122,10 +133,26 @@ data class BindConfig(
     val rearLens: RearLens,
     val flashMode: FlashMode,
     val saveSeparate: Boolean = false,
+    /** ImageCapture resolution is fixed at bind time, so quality changes require a rebind. */
+    val photoQuality: PhotoQuality = PhotoQuality.Standard,
+    val videoQuality: VideoQuality = VideoQuality.HD,
 )
 
 sealed interface CaptureEvent {
-    data class PhotosSaved(val composed: Uri?, val back: Uri?, val front: Uri?) : CaptureEvent
-    data class VideoSaved(val composed: Uri?, val back: Uri?, val front: Uri?) : CaptureEvent
+    data class PhotosSaved(
+        val composed: Uri?,
+        val back: Uri?,
+        val front: Uri?,
+        val degradedSingle: Boolean = false,
+    ) : CaptureEvent
+    data class VideoSaved(
+        val composed: Uri?,
+        val back: Uri?,
+        val front: Uri?,
+        /** Audio was requested but the microphone could not be opened; the file is silent. */
+        val audioDropped: Boolean = false,
+    ) : CaptureEvent
     data class Failed(val message: String) : CaptureEvent
+    /** Status text only (camera interrupted / recovered); does not end a capture in progress. */
+    data class Notice(val message: String) : CaptureEvent
 }

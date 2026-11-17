@@ -22,7 +22,7 @@ cd DualCam
 
 APK 在 `app/build/outputs/apk/debug/app-debug.apk`。
 
-首次打开请允许 **相机** 和 **麦克风**。照片写入 `Pictures/DualCam`，视频写入 `Movies/DualCam`。
+首次打开请允许 **相机** 和 **麦克风**。照片和视频都写入 `DCIM/DualCam`。
 
 ## 用法
 
@@ -31,11 +31,12 @@ APK 在 `app/build/outputs/apk/debug/app-debug.apk`。
 3. 需要的话切换后置 0.5× / 1× / 5×
 4. 点快门。录像时再点一次结束
 
-录像过程中不能改构图或互换镜头，避免中断编码。
+合拍录像时可以随时改构图、互换主次画面和切换后置镜头。设置里选择「分别保存」时，录像期间只能数码变焦，不能切换物理镜头。
 
 ## 实现
 
 CameraX 1.5 Concurrent Camera：
 
-- 照片：非合成模式，两路 Preview + ImageCapture
-- 录像：合成模式，共享 Preview + VideoCapture，用 `CompositionSettings` 排版
+- 照片：两路 Preview + ImageCapture，拍完在本地合成一张 JPEG。「高清」会向 HAL 申请更高的采集分辨率，但并发模式下实际尺寸由系统决定
+- 合拍录像：两路 Preview + ImageAnalysis（RGBA），帧直接上传为 GL 纹理，旋转、镜像、裁切和画中画圆角全部在 GPU 着色器完成，渲染进 MediaCodec 输入 Surface（H.264 30fps + AAC），MediaMuxer 写 MP4
+- 分别保存录像：两路 Preview + ImageCapture + VideoCapture，各写一个 MP4

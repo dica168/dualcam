@@ -6,8 +6,6 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.PorterDuff
-import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
 
@@ -17,6 +15,39 @@ object DualLayoutComposer {
     const val PIP_ASPECT = 158f / 118f
     const val PIP_INSET_X_FRACTION = 0.045f
     const val PIP_INSET_Y_FRACTION = 0.09f
+
+    /** Where the two cameras land in an output of the given size. Shared by the Canvas and GL paths. */
+    data class Placement(
+        val primary: Rect,
+        val secondary: Rect,
+        /** Corner radius of the secondary pane; 0 for split layouts. */
+        val secondaryRadius: Float,
+        /** Border stroke of the secondary pane, centered on its edge; 0 for split layouts. */
+        val secondaryStroke: Float,
+    )
+
+    fun placement(layout: DualLayout, outWidth: Int, outHeight: Int): Placement = when (layout) {
+        DualLayout.Pip -> {
+            val pipW = (outWidth * PIP_WIDTH_FRACTION).toInt()
+            val pipH = (pipW * PIP_ASPECT).toInt()
+            val insetX = (outWidth * PIP_INSET_X_FRACTION).toInt()
+            val insetY = (outHeight * PIP_INSET_Y_FRACTION).toInt()
+            Placement(
+                primary = Rect(0, 0, outWidth, outHeight),
+                secondary = Rect(outWidth - insetX - pipW, insetY, outWidth - insetX, insetY + pipH),
+                secondaryRadius = pipW * 0.08f,
+                secondaryStroke = pipW * 0.025f,
+            )
+        }
+        DualLayout.SplitVertical -> {
+            val mid = outHeight / 2
+            Placement(Rect(0, 0, outWidth, mid - 2), Rect(0, mid + 2, outWidth, outHeight), 0f, 0f)
+        }
+        DualLayout.SplitHorizontal -> {
+            val mid = outWidth / 2
+            Placement(Rect(0, 0, mid - 2, outHeight), Rect(mid + 2, 0, outWidth, outHeight), 0f, 0f)
+        }
+    }
 
     fun compose(
         back: Bitmap,
@@ -35,39 +66,26 @@ object DualLayoutComposer {
         val canvas = Canvas(output)
         canvas.drawColor(Color.BLACK)
 
-        when (layout) {
-            DualLayout.Pip -> {
-                drawCover(canvas, primary, Rect(0, 0, outWidth, outHeight), mirrorPrimary)
-                val pipW = (outWidth * PIP_WIDTH_FRACTION).toInt()
-                val pipH = (pipW * PIP_ASPECT).toInt()
-                val insetX = (outWidth * PIP_INSET_X_FRACTION).toInt()
-                val insetY = (outHeight * PIP_INSET_Y_FRACTION).toInt()
-                val pip = Rect(
-                    outWidth - insetX - pipW,
-                    insetY,
-                    outWidth - insetX,
-                    insetY + pipH,
-                )
-                drawRounded(canvas, secondary, pip, mirrorSecondary)
-            }
-            DualLayout.SplitVertical -> {
-                val mid = outHeight / 2
-                drawCover(canvas, primary, Rect(0, 0, outWidth, mid - 2), mirrorPrimary)
-                drawCover(canvas, secondary, Rect(0, mid + 2, outWidth, outHeight), mirrorSecondary)
-            }
-            DualLayout.SplitHorizontal -> {
-                val mid = outWidth / 2
-                drawCover(canvas, primary, Rect(0, 0, mid - 2, outHeight), mirrorPrimary)
-                drawCover(canvas, secondary, Rect(mid + 2, 0, outWidth, outHeight), mirrorSecondary)
-            }
+        val place = placement(layout, outWidth, outHeight)
+        drawCover(canvas, primary, place.primary, mirrorPrimary)
+        if (layout == DualLayout.Pip) {
+            drawRounded(canvas, secondary, place.secondary, mirrorSecondary, place.secondaryRadius, place.secondaryStroke)
+        } else {
+            drawCover(canvas, secondary, place.secondary, mirrorSecondary)
         }
         return output
     }
 
+    /**
+     * Returns a bitmap rotated by [rotationDegrees]. When a new bitmap is produced the
+     * receiver is recycled, since callers never use the unrotated source afterwards.
+     */
     fun Bitmap.oriented(rotationDegrees: Int): Bitmap {
         if (rotationDegrees % 360 == 0) return this
         val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-        return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
+        val rotated = Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
+        if (rotated !== this) recycle()
+        return rotated
     }
 
     private fun drawCover(canvas: Canvas, source: Bitmap, dest: Rect, mirror: Boolean) {
@@ -82,21 +100,24 @@ object DualLayoutComposer {
         canvas.restore()
     }
 
-    private fun drawRounded(canvas: Canvas, source: Bitmap, dest: Rect, mirror: Boolean) {
-        val radius = dest.width() * 0.08f
+    private fun drawRounded(
+        canvas: Canvas,
+        source: Bitmap,
+        dest: Rect,
+        mirror: Boolean,
+        radius: Float,
+        stroke: Float,
+    ) {
         val destF = RectF(dest)
-        val saved = canvas.saveLayer(destF, null)
+        // Clip instead of saveLayer: saveLayer allocates an offscreen bitmap on every call,
+        // which is far too expensive at video frame rate on a software canvas.
+        val saved = canvas.save()
         val clip = Path().apply { addRoundRect(destF, radius, radius, Path.Direction.CW) }
         canvas.clipPath(clip)
         drawCover(canvas, source, dest, mirror)
-        val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.STROKE
-            strokeWidth = dest.width() * 0.025f
-            xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_OVER)
-        }
-        canvas.drawRoundRect(destF, radius, radius, border)
         canvas.restoreToCount(saved)
+        BorderPaint.strokeWidth = stroke
+        canvas.drawRoundRect(destF, radius, radius, BorderPaint)
     }
 
     private fun centerCrop(source: Bitmap, destW: Int, destH: Int): Rect {
@@ -114,4 +135,8 @@ object DualLayoutComposer {
     }
 
     private val FilterPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    private val BorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        style = Paint.Style.STROKE
+    }
 }

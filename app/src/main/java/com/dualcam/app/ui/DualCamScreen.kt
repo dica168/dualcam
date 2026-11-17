@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.MediaStore
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -46,13 +47,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.SnackbarHost
@@ -167,7 +168,7 @@ fun DualCamScreen(viewModel: DualCamViewModel) {
                     )
                 },
             )
-            state.ready && !state.supported -> UnsupportedPane(state.supportMessage)
+            state.ready && !state.supported -> UnsupportedPane(state.supportMessage, viewModel::retry)
             else -> {
                 DualPreview(
                     layout = state.layout,
@@ -187,7 +188,6 @@ fun DualCamScreen(viewModel: DualCamViewModel) {
                         state = state,
                         onLayout = viewModel::setLayout,
                         onRearStop = viewModel::selectRearStop,
-                        onFlash = viewModel::cycleFlash,
                         onTorch = viewModel::toggleTorch,
                         onOpenSettings = viewModel::toggleSettings,
                         onSwap = viewModel::swapPrimary,
@@ -262,6 +262,9 @@ private fun DualPreview(
                     onSwap = onSwap,
                     modifier = Modifier.fillMaxSize(),
                     showLabel = false,
+                    // Only the PiP window and the swap button swap cameras; a tap on the
+                    // full-screen view would otherwise swap by accident.
+                    swapOnTap = false,
                     zoomEnabled = backPrimary && pinchZoomMax > pinchZoomMin + 0.05f,
                     zoom = rearZoom,
                     zoomMin = pinchZoomMin,
@@ -352,6 +355,7 @@ private fun CameraPane(
     onSwap: () -> Unit,
     modifier: Modifier = Modifier,
     showLabel: Boolean = true,
+    swapOnTap: Boolean = true,
     zoomEnabled: Boolean = false,
     zoom: Float = 1f,
     zoomMin: Float = 1f,
@@ -370,7 +374,7 @@ private fun CameraPane(
             modifier = Modifier
                 .fillMaxSize()
                 .then(if (zoomEnabled) Modifier.transformable(transformState) else Modifier)
-                .clickable(onClick = onSwap),
+                .then(if (swapOnTap) Modifier.clickable(onClick = onSwap) else Modifier),
         )
         if (showLabel) {
             Text(
@@ -417,7 +421,6 @@ private fun CameraChrome(
     state: DualCamUiState,
     onLayout: (DualLayout) -> Unit,
     onRearStop: (Float) -> Unit,
-    onFlash: () -> Unit,
     onTorch: () -> Unit,
     onOpenSettings: () -> Unit,
     onSwap: () -> Unit,
@@ -434,7 +437,6 @@ private fun CameraChrome(
     ) {
         TopBar(
             state = state,
-            onFlash = onFlash,
             onTorch = onTorch,
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -452,7 +454,10 @@ private fun CameraChrome(
         ) {
             RearZoomRow(
                 equivalent = state.rearZoom,
-                stops = DefaultRearZoomStops.map { it.equivalent },
+                // Hide stops the device cannot reach (e.g. 0.5× without an ultra-wide lens).
+                stops = DefaultRearZoomStops
+                    .map { it.equivalent }
+                    .filter { it >= state.pinchZoomMin - 0.01f && it <= state.pinchZoomMax + 0.01f },
                 onSelect = onRearStop,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
             )
@@ -479,7 +484,6 @@ private fun CameraChrome(
 @Composable
 private fun TopBar(
     state: DualCamUiState,
-    onFlash: () -> Unit,
     onTorch: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -674,25 +678,6 @@ private fun BottomControls(
 }
 
 @Composable
-private fun SaveModeChip(
-    saveSeparate: Boolean,
-    enabled: Boolean,
-    onClick: () -> Unit,
-) {
-    Text(
-        text = if (saveSeparate) "分别保存" else "合拍",
-        color = if (!enabled) Color(0x66FFFFFF) else if (saveSeparate) Color.White else Color.Black,
-        fontSize = 12.sp,
-        fontWeight = FontWeight.Medium,
-        modifier = Modifier
-            .clip(RoundedCornerShape(16.dp))
-            .background(if (saveSeparate) ControlScrim else Color.White)
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 6.dp),
-    )
-}
-
-@Composable
 private fun GalleryButton(uri: Uri?, onClick: () -> Unit) {
     Box(
         modifier = Modifier
@@ -837,7 +822,7 @@ private fun SettingsSheet(
             SettingsChips(
                 options = FlashMode.entries.map { it to it.settingsLabel() },
                 selected = state.flashMode,
-                enabled = !state.recording,
+                enabled = !state.recording && !state.composing,
                 onSelect = onFlash,
             )
             Spacer(Modifier.height(14.dp))
@@ -845,7 +830,7 @@ private fun SettingsSheet(
             SettingsChips(
                 options = PhotoQuality.entries.map { it to it.label },
                 selected = state.photoQuality,
-                enabled = !state.recording,
+                enabled = !state.recording && !state.composing,
                 onSelect = onPhotoQuality,
             )
             Spacer(Modifier.height(14.dp))
@@ -853,7 +838,7 @@ private fun SettingsSheet(
             SettingsChips(
                 options = VideoQuality.entries.map { it to it.label },
                 selected = state.videoQuality,
-                enabled = !state.recording,
+                enabled = !state.recording && !state.composing,
                 onSelect = onVideoQuality,
             )
             Spacer(Modifier.height(14.dp))
@@ -861,7 +846,7 @@ private fun SettingsSheet(
             SettingsChips(
                 options = listOf(false to "合拍", true to "分别保存"),
                 selected = state.saveSeparate,
-                enabled = !state.recording,
+                enabled = !state.recording && !state.composing,
                 onSelect = { if (it != state.saveSeparate) onToggleSaveSeparate() },
             )
             Spacer(Modifier.height(12.dp))
@@ -920,6 +905,7 @@ private fun FlashMode.settingsLabel(): String = when (this) {
 
 @Composable
 private fun PermissionPane(onRequest: () -> Unit) {
+    val context = LocalContext.current
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -930,7 +916,7 @@ private fun PermissionPane(onRequest: () -> Unit) {
         Text("需要相机权限", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(8.dp))
         Text(
-            "同时使用前后摄像头拍摄，需要相机和麦克风权限。",
+            "同时使用前后摄像头拍摄，需要相机和麦克风权限。若此前已拒绝，请前往系统设置开启。",
             color = Color(0xFFB0B8C1),
             fontSize = 14.sp,
             textAlign = TextAlign.Center,
@@ -943,11 +929,24 @@ private fun PermissionPane(onRequest: () -> Unit) {
         ) {
             Text("授权并开始")
         }
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = {
+                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", context.packageName, null)
+                }
+                context.startActivity(intent)
+            },
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+            contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp),
+        ) {
+            Text("打开系统应用设置")
+        }
     }
 }
 
 @Composable
-private fun UnsupportedPane(message: String?) {
+private fun UnsupportedPane(message: String?, onRetry: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -970,6 +969,14 @@ private fun UnsupportedPane(message: String?) {
             fontSize = 13.sp,
             textAlign = TextAlign.Center,
         )
+        Spacer(Modifier.height(24.dp))
+        Button(
+            onClick = onRetry,
+            colors = ButtonDefaults.buttonColors(containerColor = AccentBlue, contentColor = Color.Black),
+            contentPadding = PaddingValues(horizontal = 24.dp, vertical = 12.dp),
+        ) {
+            Text("重试")
+        }
     }
 }
 
@@ -977,12 +984,6 @@ private fun DualLayout.label(): String = when (this) {
     DualLayout.Pip -> "画中画"
     DualLayout.SplitVertical -> "上下"
     DualLayout.SplitHorizontal -> "左右"
-}
-
-private fun FlashMode.icon(): ImageVector = when (this) {
-    FlashMode.Off -> Icons.Filled.FlashOff
-    FlashMode.Auto -> Icons.Filled.FlashAuto
-    FlashMode.On -> Icons.Filled.FlashOn
 }
 
 private fun formatTime(ms: Long): String {
@@ -1024,9 +1025,9 @@ private fun openGallery(context: Context, lastUri: Uri?) {
         data = target
         addFlags(flags)
     }
-    if (review.resolveActivity(context.packageManager) != null &&
-        runCatching { context.startActivity(review) }.isSuccess
-    ) {
+    // resolveActivity() needs a <queries> declaration on API 30+ and would always return null
+    // here; startActivity() itself is not subject to package visibility, so just try it.
+    if (runCatching { context.startActivity(review) }.isSuccess) {
         return
     }
     val mime = context.contentResolver.getType(target) ?: "*/*"
