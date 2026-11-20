@@ -123,8 +123,21 @@ class DualCamViewModel(application: Application) : AndroidViewModel(application)
                         }
                     }
                     is CaptureEvent.Notice -> {
+                        // The lens list read at startup may have been incomplete; a notice is
+                        // sent whenever the cameras come back, so refresh it here.
+                        val lenses = session.availableLenses()
                         _uiState.update {
-                            it.copy(message = event.message, rearZoomRange = session.rearZoomRange())
+                            val base = it.copy(message = event.message, rearZoomRange = session.rearZoomRange())
+                            if (lenses == null || lenses == it.availableLenses) {
+                                base
+                            } else {
+                                val (pinchMin, pinchMax) = equivalentZoomBounds(lenses)
+                                base.copy(
+                                    availableLenses = lenses,
+                                    pinchZoomMin = pinchMin,
+                                    pinchZoomMax = pinchMax,
+                                )
+                            }
                         }
                     }
                 }

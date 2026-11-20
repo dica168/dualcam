@@ -11,6 +11,8 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.display.DisplayManager
@@ -155,6 +157,14 @@ class DualCameraSession(private val context: Context) {
     private var interruptionNotified = false
     private var lastCameraError: Int? = null
     private var capturesInFlight = 0
+    /**
+     * CameraX had no front+back pair to bind. It adds and removes cameras at runtime (and skips
+     * the missing ones without an error), so this is polled until the pair shows up again.
+     */
+    private var pairMissing = false
+    private var pairMissingSince = 0L
+    private var pairMissingExplained = false
+    private var providerRestartAt = 0L
     private var watchdogJob: Job? = null
     private val stateObservers = mutableListOf<Pair<LiveData<CameraState>, Observer<CameraState>>>()
 
@@ -163,15 +173,20 @@ class DualCameraSession(private val context: Context) {
         val cameraProvider = obtainProvider()
         val pairs = cameraProvider.availableConcurrentCameraInfos
         val lenses = runCatching { detectLenses(pairs) }.getOrDefault(listOf(RearLens.Wide))
-        if (pairs.isEmpty()) {
-            val message = if (feature) {
-                "系统声明支持并发相机，但当前没有可用的前后摄像头组合。"
-            } else {
-                "这台设备没有开放前后摄像头同时工作。Pixel 10 Pro XL 应支持此功能。"
-            }
+        // On a device that declares concurrent support a missing pair is temporary (the camera
+        // list is refreshed at runtime), so that case is left to bind(), which keeps retrying.
+        if (!feature && listRearTargets(cameraProvider).isEmpty()) {
+            val message = "这台设备没有开放前后摄像头同时工作。Pixel 10 Pro XL 应支持此功能。"
             return PrepareResult(supported = false, message = message, lenses = lenses)
         }
         return PrepareResult(supported = true, message = null, lenses = lenses)
+    }
+
+    /** Rear lenses as currently reported, or null while no front+back pair is available. */
+    fun availableLenses(): List<RearLens>? {
+        val cameraProvider = provider ?: return null
+        if (listRearTargets(cameraProvider).isEmpty()) return null
+        return runCatching { detectLenses(cameraProvider.availableConcurrentCameraInfos) }.getOrNull()
     }
 
     suspend fun bind(owner: LifecycleOwner, config: BindConfig) {
@@ -202,17 +217,19 @@ class DualCameraSession(private val context: Context) {
         if (!recordingSession && boundConfig == config && concurrent != null && boundOwner === owner) return
 
         resetBindings(cameraProvider)
+        // Set before anything can fail: the watchdog only retries for an owner it knows about.
+        boundOwner = owner
 
         val target = resolveRearTarget(cameraProvider, config.rearLens)
         if (target == null) {
-            _events.tryEmit(CaptureEvent.Failed("找不到可同时开启的前后摄像头组合。"))
+            onPairMissing(cameraProvider)
             return
         }
+        pairMissing = false
 
         lastBackSelector = target.backSelector
         lastFrontSelector = target.frontSelector
         rearIntrinsic = target.intrinsic
-        boundOwner = owner
         val rotation = displayRotation(owner)
         try {
             bindCameras(owner, cameraProvider, target.backSelector, target.frontSelector, rotation, config)
@@ -658,6 +675,7 @@ class DualCameraSession(private val context: Context) {
         concurrent = null
         boundConfig = null
         wantedConfig = null
+        pairMissing = false
         boundOwner = null
         backCamera = null
         frontCamera = null
@@ -966,6 +984,10 @@ class DualCameraSession(private val context: Context) {
             if (recoverAttempts > MAX_FAST_ATTEMPTS) recoverAttempts = 0
             return
         }
+        if (pairMissing) {
+            awaitCameraPair(owner, config, now)
+            return
+        }
         // Both cameras must be streaming, so the staler of the two decides.
         val lastFrame = minOf(backFrameAt.get(), frontFrameAt.get())
         val since = maxOf(watchSince, lastErrorAt)
@@ -1023,6 +1045,84 @@ class DualCameraSession(private val context: Context) {
             bind(owner, config)
             applyEquivalentZoom(lastZoom)
         }
+    }
+
+    private fun onPairMissing(cameraProvider: ProcessCameraProvider) {
+        if (!pairMissing) {
+            pairMissing = true
+            pairMissingSince = SystemClock.elapsedRealtime()
+            pairMissingExplained = false
+            providerRestartAt = 0L
+            Log.w(TAG, "no front+back pair to bind; ${describeCameras(cameraProvider)}")
+        }
+        notifyInterruption("暂时找不到可同时开启的前后摄像头，正在重试…")
+    }
+
+    /** Nothing is bound while the pair is missing, so poll for it instead of watching frames. */
+    private suspend fun awaitCameraPair(owner: LifecycleOwner, config: BindConfig, now: Long) {
+        val cameraProvider = obtainProvider()
+        if (listRearTargets(cameraProvider).isNotEmpty()) {
+            Log.i(TAG, "front+back pair is available again; binding")
+            bind(owner, config)
+            applyEquivalentZoom(lastZoom)
+            return
+        }
+        val waited = now - pairMissingSince
+        val sinceRestart = if (providerRestartAt == 0L) Long.MAX_VALUE else now - providerRestartAt
+        if (waited >= PROVIDER_RESTART_MS && sinceRestart >= PROVIDER_RESTART_INTERVAL_MS &&
+            systemHasConcurrentPair()
+        ) {
+            // The system offers the pair but CameraX's camera list does not: its list is stale.
+            providerRestartAt = now
+            Log.w(TAG, "CameraX is missing a pair the system offers; restarting it. ${describeCameras(cameraProvider)}")
+            restartProvider(cameraProvider)
+            return
+        }
+        if (!pairMissingExplained && waited >= PAIR_MISSING_EXPLAIN_MS) {
+            pairMissingExplained = true
+            Log.w(TAG, "still no front+back pair; ${describeCameras(cameraProvider)}")
+            notifyInterruption("系统暂时没有提供可同时使用的前后摄像头。请关闭其他正在使用相机的应用；这里会继续自动重试。")
+        }
+    }
+
+    /** Throws CameraX's process-wide instance away so the next bind builds a fresh camera list. */
+    @SuppressLint("VisibleForTests")
+    private suspend fun restartProvider(cameraProvider: ProcessCameraProvider) {
+        resetBindings(cameraProvider)
+        provider = null
+        runCatching { cameraProvider.shutdownAsync().await() }
+            .onFailure { Log.w(TAG, "CameraX shutdown failed", it) }
+    }
+
+    private fun systemHasConcurrentPair(): Boolean = runCatching {
+        val manager = context.getSystemService(CameraManager::class.java)
+        manager.concurrentCameraIds.any { ids ->
+            val facings = ids.map {
+                manager.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING)
+            }
+            CameraMetadata.LENS_FACING_FRONT in facings && CameraMetadata.LENS_FACING_BACK in facings
+        }
+    }.getOrDefault(false)
+
+    /** One line for logcat: what CameraX and the system each report right now. */
+    private fun describeCameras(cameraProvider: ProcessCameraProvider): String {
+        fun label(info: CameraInfo): String {
+            val id = runCatching { Camera2CameraInfo.from(info).cameraId }.getOrDefault("?")
+            val facing = when (info.lensFacing) {
+                CameraSelector.LENS_FACING_FRONT -> "front"
+                CameraSelector.LENS_FACING_BACK -> "back"
+                else -> "other"
+            }
+            return "$id/$facing"
+        }
+        val groups = runCatching {
+            cameraProvider.availableConcurrentCameraInfos.map { group -> group.map(::label) }
+        }.getOrNull()
+        val all = runCatching { cameraProvider.availableCameraInfos.map(::label) }.getOrNull()
+        val manager = context.getSystemService(CameraManager::class.java)
+        val systemIds = runCatching { manager.cameraIdList.toList() }.getOrNull()
+        val systemGroups = runCatching { manager.concurrentCameraIds }.getOrNull()
+        return "cameraX concurrent=$groups all=$all; system ids=$systemIds concurrent=$systemGroups"
     }
 
     private fun notifyInterruption(message: String) {
@@ -1243,6 +1343,11 @@ class DualCameraSession(private val context: Context) {
         /** After the quick attempts, keep retrying quietly at this interval. */
         private const val SLOW_RETRY_MS = 10_000L
         private const val REBIND_SETTLE_MS = 400L
+        /** How long a missing front+back pair is waited out before saying more about it. */
+        private const val PAIR_MISSING_EXPLAIN_MS = 8_000L
+        /** A pair the system offers but CameraX lacks for this long means CameraX is stale. */
+        private const val PROVIDER_RESTART_MS = 5_000L
+        private const val PROVIDER_RESTART_INTERVAL_MS = 30_000L
     }
 
     private data class RearTarget(
